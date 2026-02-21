@@ -41,6 +41,7 @@ cargo build --release
 
 - Rust 1.93.1 或更高版本
 - 互联网连接
+可能需要依赖"sudo apk add openssl-libs-static"
 
 ## 注意事项
 - 软件的配置文件已经做了相应的加密存储处理，但是请仍妥善保管配置文件
