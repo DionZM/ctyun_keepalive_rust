@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use chrono::Local;
+use clap::Parser;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use hex::ToHex;
@@ -15,8 +16,9 @@ use sha1::Sha1;
 use sha2::Sha256;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write, BufWriter};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::Networks;
@@ -26,7 +28,104 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use urlencoding::encode;
 
+// 全局日志写入器
+use std::sync::Mutex;
 
+lazy_static::lazy_static! {
+    static ref LOG_WRITER: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+    static ref EXECUTABLE_DIR: Mutex<PathBuf> = Mutex::new(PathBuf::new());
+}
+
+/// 命令行参数
+#[derive(Parser, Debug)]
+#[command(name = "ctyun_keepalive")]
+#[command(about = "天翼云桌面保活工具")]
+#[command(version = "1.1.0")]
+struct Args {
+    /// 后台运行模式，输出将写入run.log文件
+    #[arg(short = 'b', long = "background")]
+    background: bool,
+    
+    /// 内部使用：标记为子进程模式
+    #[arg(long = "child-process", hide = true)]
+    child_process: bool,
+}
+
+/// 初始化日志系统
+fn init_logging(background: bool) -> Result<()> {
+    // 获取可执行文件所在目录
+    let exe_path = std::env::current_exe()?;
+    let exe_dir = exe_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    
+    *EXECUTABLE_DIR.lock().unwrap() = exe_dir.clone();
+    
+    if background {
+        let log_path = exe_dir.join("run.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let writer = BufWriter::new(file);
+        *LOG_WRITER.lock().unwrap() = Some(writer);
+    }
+    
+    Ok(())
+}
+
+/// 写入日志（同时输出到控制台和文件）
+fn write_line(value: &str) {
+    let ts = Local::now().format("%H:%M:%S%.6f").to_string();
+    let ts = &ts[..ts.len() - 4];
+    let line = format!("[{}] {}", ts, value);
+    
+    // 输出到控制台
+    println!("{}", line);
+    
+    // 如果启用了后台模式，写入文件
+    if let Ok(mut writer_opt) = LOG_WRITER.lock() {
+        if let Some(ref mut writer) = *writer_opt {
+            let _ = writeln!(writer, "{}", line);
+            let _ = writer.flush();
+        }
+    }
+}
+
+/// 检查并轮转status.log文件
+fn check_and_rotate_status_log() {
+    if let Ok(exe_dir) = EXECUTABLE_DIR.lock() {
+        let status_log_path = exe_dir.join("status.log");
+        let status_log_old_path = exe_dir.join("status.log.old");
+        
+        if status_log_path.exists() {
+            if let Ok(metadata) = fs::metadata(&status_log_path) {
+                let file_size = metadata.len();
+                const MAX_SIZE: u64 = 1 * 1024 * 1024; // 1MB
+                
+                if file_size >= MAX_SIZE {
+                    // 删除旧的 .old 文件（如果存在）
+                    if status_log_old_path.exists() {
+                        let _ = fs::remove_file(&status_log_old_path);
+                    }
+                    
+                    // 将当前 status.log 重命名为 status.log.old
+                    let _ = fs::rename(&status_log_path, &status_log_old_path);
+                    write_line("status.log 已达到1MB，已轮转至 status.log.old");
+                }
+            }
+        }
+    }
+}
+
+/// 启动status.log监控任务
+fn start_status_log_monitor() {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60)); // 每60秒检查一次
+        loop {
+            interval.tick().await;
+            check_and_rotate_status_log();
+        }
+    });
+}
 
 fn get_system_fingerprint() -> String {
     let networks = Networks::new_with_refreshed_list();
@@ -819,12 +918,6 @@ impl CtYunApi {
     }
 }
 
-fn write_line(value: &str) {
-    let ts = Local::now().format("%H:%M:%S%.6f").to_string();
-    let ts = &ts[..ts.len() - 4];
-    println!("[{}] {}", ts, value);
-}
-
 fn compute_md5(value: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(value.as_bytes());
@@ -1129,9 +1222,38 @@ async fn keep_alive_worker(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    write_line("版本：v 1.0.0");
+/// 后台运行（Windows守护进程模式）
+#[cfg(windows)]
+fn run_as_background() -> Result<()> {
+    use std::process::{Command, Stdio};
+    use std::os::windows::process::CommandExt;
+    
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const DETACHED_PROCESS: u32 = 0x00000008;
+    
+    let exe_path = std::env::current_exe()?;
+    let current_dir = std::env::current_dir()?;
+    
+    // 启动新进程，不带后台参数（避免无限递归），并分离控制台
+    // 注意：不重定向stdout/stderr，让子进程自己处理日志写入
+    let mut cmd = Command::new(&exe_path);
+    cmd.arg("--child-process")  // 使用特殊标记表示这是子进程
+        .current_dir(&current_dir)  // 设置工作目录为当前目录
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    
+    let _ = cmd.spawn()?;
+    
+    println!("程序已在后台启动，日志写入 run.log");
+    Ok(())
+}
+
+/// 实际的主程序逻辑
+async fn run_main() -> Result<()> {
+    write_line("版本：v 1.1.0");
+    
+    // 启动status.log监控任务
+    start_status_log_monitor();
     
     let accounts = resolve_accounts()?;
     if accounts.is_empty() {
@@ -1206,4 +1328,37 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // 解析命令行参数
+    let args = Args::parse();
+    
+    // 检查是否是子进程模式（后台运行的实际工作进程）
+    if args.child_process {
+        // 子进程模式：初始化日志并运行主程序
+        init_logging(true)?;
+        write_line("后台进程已启动，日志将写入 run.log");
+        return run_main().await;
+    }
+    
+    // 正常启动模式
+    if args.background {
+        // 后台模式：启动守护进程后退出
+        #[cfg(windows)]
+        {
+            return run_as_background();
+        }
+        #[cfg(not(windows))]
+        {
+            // 非Windows平台直接运行（可以在这里添加Unix守护进程逻辑）
+            init_logging(true)?;
+            return run_main().await;
+        }
+    } else {
+        // 前台模式
+        init_logging(false)?;
+        return run_main().await;
+    }
 }
