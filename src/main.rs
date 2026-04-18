@@ -1249,6 +1249,35 @@ fn run_as_background() -> Result<()> {
     Ok(())
 }
 
+/// 后台运行（Unix守护进程模式）
+#[cfg(not(windows))]
+fn run_as_background() -> Result<()> {
+    use std::process::{Command, Stdio};
+    
+    let exe_path = std::env::current_exe()?;
+    let current_dir = std::env::current_dir()?;
+    
+    // Unix平台使用nohup方式启动后台进程
+    let mut cmd = Command::new(&exe_path);
+    cmd.arg("--child-process")
+        .current_dir(&current_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    
+    // 在Unix系统上，通过设置进程组ID来分离进程
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    
+    let _ = cmd.spawn()?;
+    
+    println!("程序已在后台启动，日志写入 run.log");
+    Ok(())
+}
+
 /// 实际的主程序逻辑
 async fn run_main() -> Result<()> {
     write_line("版本：v 1.2.0");
@@ -1346,17 +1375,8 @@ async fn main() -> Result<()> {
     
     // 正常启动模式
     if args.background {
-        // 后台模式：启动守护进程后退出
-        #[cfg(windows)]
-        {
-            return run_as_background();
-        }
-        #[cfg(not(windows))]
-        {
-            // 非Windows平台直接运行（可以在这里添加Unix守护进程逻辑）
-            init_logging(true)?;
-            return run_main().await;
-        }
+        // 后台模式：启动守护进程后退出（跨平台支持）
+        return run_as_background();
     } else {
         // 前台模式
         init_logging(false)?;
