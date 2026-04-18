@@ -40,7 +40,7 @@ lazy_static::lazy_static! {
 #[derive(Parser, Debug)]
 #[command(name = "ctyun_keepalive")]
 #[command(about = "天翼云桌面保活工具")]
-#[command(version = "1.1.0")]
+#[command(version = "1.2.0")]
 struct Args {
     /// 后台运行模式，输出将写入run.log文件
     #[arg(short = 'b', long = "background")]
@@ -90,39 +90,40 @@ fn write_line(value: &str) {
     }
 }
 
-/// 检查并轮转status.log文件
-fn check_and_rotate_status_log() {
+/// 检查并轮转run.log文件
+fn check_and_rotate_run_log() {
     if let Ok(exe_dir) = EXECUTABLE_DIR.lock() {
-        let status_log_path = exe_dir.join("status.log");
-        let status_log_old_path = exe_dir.join("status.log.old");
+        let run_log_path = exe_dir.join("run.log");
+        let run_log_old_path = exe_dir.join("run.log.old");
         
-        if status_log_path.exists() {
-            if let Ok(metadata) = fs::metadata(&status_log_path) {
+        if run_log_path.exists() {
+            if let Ok(metadata) = fs::metadata(&run_log_path) {
                 let file_size = metadata.len();
                 const MAX_SIZE: u64 = 1 * 1024 * 1024; // 1MB
                 
                 if file_size >= MAX_SIZE {
                     // 删除旧的 .old 文件（如果存在）
-                    if status_log_old_path.exists() {
-                        let _ = fs::remove_file(&status_log_old_path);
+                    if run_log_old_path.exists() {
+                        let _ = fs::remove_file(&run_log_old_path);
                     }
                     
-                    // 将当前 status.log 重命名为 status.log.old
-                    let _ = fs::rename(&status_log_path, &status_log_old_path);
-                    write_line("status.log 已达到1MB，已轮转至 status.log.old");
+                    // 将当前 run.log 重命名为 run.log.old
+                    let _ = fs::rename(&run_log_path, &run_log_old_path);
+                    // 注意：这里不能直接调用 write_line，因为文件已被重命名
+                    println!("run.log 已达到1MB，已轮转至 run.log.old");
                 }
             }
         }
     }
 }
 
-/// 启动status.log监控任务
-fn start_status_log_monitor() {
+/// 启动run.log监控任务
+fn start_run_log_monitor() {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60)); // 每60秒检查一次
         loop {
             interval.tick().await;
-            check_and_rotate_status_log();
+            check_and_rotate_run_log();
         }
     });
 }
@@ -1250,10 +1251,10 @@ fn run_as_background() -> Result<()> {
 
 /// 实际的主程序逻辑
 async fn run_main() -> Result<()> {
-    write_line("版本：v 1.1.0");
+    write_line("版本：v 1.2.0");
     
-    // 启动status.log监控任务
-    start_status_log_monitor();
+    // 启动run.log监控任务
+    start_run_log_monitor();
     
     let accounts = resolve_accounts()?;
     if accounts.is_empty() {
